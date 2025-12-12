@@ -1,7 +1,8 @@
 use socket2::{Domain, Protocol, Socket, Type};
+use std::net::TcpStream;
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Read, Write},
     net::UdpSocket,
     time::Duration,
 };
@@ -16,6 +17,30 @@ struct Watcher {
     socket: UdpSocket,
     packet: Vec<u8>,
     buf: Vec<u8>,
+}
+
+/*
+ * type # bytes
+ * health check # 1001
+ * turn on lights # 1002
+ * turn off lights # 1003
+ * make noise # 1004
+ * stop noise # 1005
+ * start loud alarm # 1006
+ * stop loud alarm # 1007
+ */
+enum Message {
+    MakeNoise,
+    StopNoise,
+}
+
+impl Message {
+    fn bytes(self) -> [u8; 4] {
+        match self {
+            Self::MakeNoise => [1, 0, 0, 4],
+            Self::StopNoise => [1, 0, 0, 5],
+        }
+    }
 }
 
 impl Watcher {
@@ -119,9 +144,7 @@ impl Watcher {
     }
 }
 
-const MAX_TOLERANCE: u16 = 10;
-
-fn main() -> Result<(), WatchError> {
+fn main() {
     let mut watchdog = Watcher::new();
 
     let f = File::open("target_hosts").expect("target_hosts file not found");
@@ -131,35 +154,51 @@ fn main() -> Result<(), WatchError> {
         .map(|l| l.expect("cannot create new string out of each host in the target_hosts file"))
         .collect();
 
-    let mut tolerance: u16 = 1;
-
-    loop {
-        for host in &targets {
-            // TODO: make them async, but without futures
-            // keeping the state of each target host
-            match watchdog.ping(host) {
-                Ok(()) => {}
-                Err(e) => match e {
-                    WatchError::Alarm => {
-                        eprintln!("Alarm!");
-                        tolerance += 1;
+    for _ in 0..1 {
+        //for host in &targets {
+        let host = "192.168.1.3";
+        // TODO: make them async, but without futures
+        // keeping the state of each target host
+        match watchdog.ping(host) {
+            Ok(()) => {
+                // TODO:seize alarm if all targets are pinged sucessfully
+            }
+            Err(e) => match e {
+                WatchError::Alarm => {
+                    eprintln!("Alarm!");
+                    if send_alarm_notification().is_err() {
+                        eprintln!("sending alarm notification returned error!");
                     }
-                    WatchError::Io(ioerr) => {
-                        eprintln!("io error: {}", ioerr);
-                    }
-                },
-            };
-            watchdog.reset_buf();
-        }
+                }
+                WatchError::Io(ioerr) => {
+                    eprintln!("io error: {}", ioerr);
+                }
+            },
+        };
+        watchdog.reset_buf();
+        //}
 
-        // TODO: reset tolerance
-        if tolerance >= MAX_TOLERANCE {
-            todo!()
-            //watchdog.bark()
-        }
         watchdog.step_packet_sequence();
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+// printf "\x01\x00\x00\x05" | nc 127.0.0.1 8080
+fn send_alarm_notification() -> std::io::Result<()> {
+    let mut stream = TcpStream::connect("0.0.0.0:8080")?;
+
+    let message = Message::MakeNoise;
+    stream.write_all(&message.bytes())?;
+
+    let mut buf = [0u8; 2];
+    let _ = stream.read(&mut buf)?;
+    if buf != "ok".as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response is not ok",
+        ));
+    }
+    Ok(())
 }
 
 // The linux kernel calculates this anyway
