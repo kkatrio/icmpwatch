@@ -7,8 +7,10 @@ use std::{
     time::Duration,
 };
 
+const INTERVAL_SECS: u64 = 2;
+
 #[derive(Debug)]
-enum WatchError {
+enum PingError {
     Io(io::Error),
     Alarm,
 }
@@ -49,7 +51,7 @@ impl Watcher {
             .expect("cannot initialize Socket");
         let socket: UdpSocket = socket.into();
         socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
 
         // https://www.rfc-editor.org/rfc/rfc792
@@ -76,7 +78,7 @@ impl Watcher {
         }
     }
 
-    fn ping(&mut self, target: &str) -> Result<(), WatchError> {
+    fn ping(&mut self, target: &str) -> Result<(), PingError> {
         let seq = u16::from_be_bytes([self.packet[6], self.packet[7]]);
         let start = std::time::Instant::now();
         self.socket
@@ -84,52 +86,58 @@ impl Watcher {
             .expect("unable to send packet");
         println!("ping {} {} bytes. seq: {}", target, self.packet.len(), seq);
 
-        let (size, destination_addr) = self
-            .socket
-            .recv_from(&mut self.buf)
-            .expect("error receiving response");
+        let (size, destination_addr) = match self.socket.recv_from(&mut self.buf) {
+            Ok((sz, dest)) => (sz, dest),
+            Err(..) => {
+                eprintln!("Unable to receive response. Host must be down.");
+                return Err(PingError::Alarm);
+            }
+        };
+
         let duration = start.elapsed();
 
-        //const IP_HEADER_LEN: usize = 20;
-        //let icmp_msg = &buf[IP_HEADER_LEN..];
-
+        // basic validation check
         if size < 8 {
-            return Err(WatchError::Io(io::Error::new(
+            return Err(PingError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("received only {} bytes", size),
             )));
         }
 
+        // 0 Echo Reply
+        // 3 Destination Unreachable
         let type_byte = self.buf[0];
-        let sequence_received = u16::from_be_bytes([self.buf[6], self.buf[7]]);
-        // let reply_seq = ((data[6] as u16) << 8) | (data[7] as u16);
-        if type_byte != 0 {
-            return Err(WatchError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("received type {}.", type_byte),
-            )));
-        }
 
-        if sequence_received != seq {
-            return Err(WatchError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("seq {}, sequence received {}", seq, sequence_received),
-            )));
+        if type_byte == 0 {
+            // check messages sequence
+            let sequence_received = u16::from_be_bytes([self.buf[6], self.buf[7]]);
+            // let reply_seq = ((data[6] as u16) << 8) | (data[7] as u16);
+            if sequence_received != seq {
+                return Err(PingError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("seq {}, sequence received {}", seq, sequence_received),
+                )));
+            }
+            // successfull print
+            println!(
+                "{} bytes from {} time={} ms, icmp_seq={}",
+                size,
+                destination_addr,
+                duration.as_millis(),
+                sequence_received
+            );
+            return Ok(());
+        } else if type_byte == 3 {
+            println!(
+                "icmp_seq= {} Destination Host Unreachable. Destination: {}",
+                seq, destination_addr
+            );
+        } else {
+            println!("received message with type: {}", type_byte);
         }
-        // raise alarm if destination host unreachable
-        if type_byte == 3 {
-            return Err(WatchError::Alarm);
-        }
-
-        println!(
-            "{} bytes from {} time={} ms, icmp_seq={}",
-            size,
-            destination_addr,
-            duration.as_millis(),
-            sequence_received
-        );
-
-        Ok(())
+        // raise the alarm on any not sucessfull reply.
+        // TODO: raise differect alarm severities per case
+        Err(PingError::Alarm)
     }
 
     fn step_packet_sequence(&mut self) {
@@ -154,40 +162,51 @@ fn main() {
         .map(|l| l.expect("cannot create new string out of each host in the target_hosts file"))
         .collect();
 
-    for _ in 0..1 {
-        //for host in &targets {
-        let host = "192.168.1.3";
-        // TODO: make them async, but without futures
-        // keeping the state of each target host
-        match watchdog.ping(host) {
-            Ok(()) => {
-                // TODO:seize alarm if all targets are pinged sucessfully
-            }
-            Err(e) => match e {
-                WatchError::Alarm => {
-                    eprintln!("Alarm!");
-                    if send_alarm_notification().is_err() {
-                        eprintln!("sending alarm notification returned error!");
+    //#[derive(PartialEq)]
+    //enum Status {
+    //    Alive,
+    //    Down,
+    //}
+
+    //let mut status_map: HashMap<String, Status> = HashMap::with_capacity(targets.len());
+
+    loop {
+        for host in &targets {
+            // TODO: make them async, but without futures
+            // keeping the state of each target host
+            match watchdog.ping(host) {
+                Ok(()) => {
+                    // update status
+                    //if let Some(status) = status_map.get_mut(host) {
+                    //    *status = Status::Alive;
+                    //}
+                }
+                Err(e) => match e {
+                    PingError::Alarm => {
+                        println!("Alarm! sending notification for host: {}", host);
+                        //status_map.insert(host.to_string(), Status::Down);
+                        if send_alarm_notification(Message::MakeNoise).is_err() {
+                            eprintln!("sending alarm notification returned error!");
+                        }
                     }
-                }
-                WatchError::Io(ioerr) => {
-                    eprintln!("io error: {}", ioerr);
-                }
-            },
-        };
-        watchdog.reset_buf();
-        //}
+                    PingError::Io(ioerr) => {
+                        eprintln!("io error: {}", ioerr);
+                    }
+                },
+            };
+            watchdog.reset_buf();
+        }
 
         watchdog.step_packet_sequence();
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(INTERVAL_SECS));
     }
 }
 
+// TODO: make this not return result, since we do nothing with the error. Just print it here.
 // printf "\x01\x00\x00\x05" | nc 127.0.0.1 8080
-fn send_alarm_notification() -> std::io::Result<()> {
+fn send_alarm_notification(message: Message) -> std::io::Result<()> {
     let mut stream = TcpStream::connect("0.0.0.0:8080")?;
 
-    let message = Message::MakeNoise;
     stream.write_all(&message.bytes())?;
 
     let mut buf = [0u8; 2];
