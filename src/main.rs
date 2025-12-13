@@ -1,5 +1,5 @@
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
@@ -202,13 +202,16 @@ fn main() {
     }
 }
 
-// TODO: make this not return result, since we do nothing with the error. Just print it here.
 // printf "\x01\x00\x00\x05" | nc 127.0.0.1 8080
 fn send_alarm_notification(message: Message) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect("0.0.0.0:8080")?;
+    let mut addrs_iter = "olympus:8080".to_socket_addrs().unwrap();
+    let addr = addrs_iter
+        .next()
+        .expect("addr must be created out of the domain");
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    println!("done connecting");
 
     stream.write_all(&message.bytes())?;
-
     let mut buf = [0u8; 2];
     let _ = stream.read(&mut buf)?;
     if buf != "ok".as_bytes() {
