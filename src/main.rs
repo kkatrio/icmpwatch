@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-const INTERVAL_SECS: u64 = 2;
+const INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug)]
 enum PingError {
@@ -79,12 +79,18 @@ impl Watcher {
     }
 
     fn ping(&mut self, target: &str) -> Result<(), PingError> {
-        let seq = u16::from_be_bytes([self.packet[6], self.packet[7]]);
         let start = std::time::Instant::now();
         self.socket
             .send_to(&self.packet, (target, 0))
             .expect("unable to send packet");
-        println!("ping {} {} bytes. seq: {}", target, self.packet.len(), seq);
+
+        let watcher_seq = u16::from_be_bytes([self.packet[6], self.packet[7]]);
+        println!(
+            "> ping {} {} bytes watcher_seq: {}",
+            target,
+            self.packet.len(),
+            watcher_seq
+        );
 
         let (size, destination_addr) = match self.socket.recv_from(&mut self.buf) {
             Ok((sz, dest)) => (sz, dest),
@@ -93,7 +99,6 @@ impl Watcher {
                 return Err(PingError::Alarm);
             }
         };
-
         let duration = start.elapsed();
 
         // basic validation check
@@ -112,10 +117,13 @@ impl Watcher {
             // check messages sequence
             let sequence_received = u16::from_be_bytes([self.buf[6], self.buf[7]]);
             // let reply_seq = ((data[6] as u16) << 8) | (data[7] as u16);
-            if sequence_received != seq {
+            if sequence_received != watcher_seq {
                 return Err(PingError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("seq {}, sequence received {}", seq, sequence_received),
+                    format!(
+                        "{} responded with sequence {} but watcher send seq {}",
+                        target, watcher_seq, sequence_received
+                    ),
                 )));
             }
             // successfull print
@@ -129,8 +137,8 @@ impl Watcher {
             return Ok(());
         } else if type_byte == 3 {
             println!(
-                "icmp_seq= {} Destination Host Unreachable. Destination: {}",
-                seq, destination_addr
+                "watcher_seq= {} Destination Host Unreachable. Destination: {}",
+                watcher_seq, destination_addr
             );
         } else {
             println!("received message with type: {}", type_byte);
@@ -222,39 +230,3 @@ fn send_alarm_notification(message: Message) -> std::io::Result<()> {
     }
     Ok(())
 }
-
-// The linux kernel calculates this anyway
-#[allow(dead_code)]
-fn calculate_checksum(msg: &[u8]) -> u16 {
-    // The checksum is the 16-bit ones's complement of the one's
-    // complement sum of the ICMP message starting with the ICMP Type.
-    // For computing the checksum , the checksum field should be zero.
-    // If the total length is odd, the received data is padded with one
-    // octet of zeros for computing the checksum.
-    let mut sum: u32 = 0;
-    let chunks = msg.chunks_exact(2);
-    let remainder = chunks.remainder();
-
-    for chunk in chunks {
-        let word = u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-        sum += word;
-    }
-
-    assert!(remainder.len() == 1);
-    let word = u16::from_be_bytes([remainder[0], 0]) as u32;
-    sum += word;
-
-    while (sum >> 16) != 0 {
-        // last 16 bits + the first 16 bits that overflow
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-
-    //one's compliment
-    !sum as u16
-}
-//let checksum = calculate_checksum(&packet);
-//dbg!(checksum);
-// first 8 bits
-//packet[2] = (checksum >> 8) as u8;
-//// last 8 bits
-//packet[3] = (checksum & 0xff) as u8;
