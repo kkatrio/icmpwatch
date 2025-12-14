@@ -7,18 +7,12 @@ use std::{
     time::Duration,
 };
 
-const INTERVAL_SECS: u64 = 5;
+const INTERVAL_SECS: u64 = 2;
 
 #[derive(Debug)]
 enum PingError {
     Io(io::Error),
     Alarm,
-}
-
-struct Watcher {
-    socket: UdpSocket,
-    packet: Vec<u8>,
-    buf: Vec<u8>,
 }
 
 /*
@@ -31,12 +25,12 @@ struct Watcher {
  * start loud alarm # 1006
  * stop loud alarm # 1007
  */
-enum Message {
+enum IpcMessage {
     MakeNoise,
     StopNoise,
 }
 
-impl Message {
+impl IpcMessage {
     fn bytes(self) -> [u8; 4] {
         match self {
             Self::MakeNoise => [1, 0, 0, 4],
@@ -45,15 +39,12 @@ impl Message {
     }
 }
 
-impl Watcher {
-    fn new() -> Watcher {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
-            .expect("cannot initialize Socket");
-        let socket: UdpSocket = socket.into();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+struct IcmpMessage {
+    packet: Vec<u8>,
+}
 
+impl IcmpMessage {
+    fn new(seq: u16) -> IcmpMessage {
         // https://www.rfc-editor.org/rfc/rfc792
         // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         // |     Type      |     Code      |          Checksum             |
@@ -62,71 +53,83 @@ impl Watcher {
         // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         // |     Data ...
         // +-+-+-+-+-
+
         let packet: Vec<u8> = vec![
             8, // type
             0, // code
-            0, 0, // checksum
-            0, 30, // identifier
-            0, 0, // sequence,
-            b'a', b'l', b'i', b'v', b'e',
+            0,
+            0, // checksum
+            0,
+            30, // identifier
+            (seq >> 8) as u8,
+            (seq & 0xff) as u8, // sequence
+            b'a',
+            b'l',
+            b'i',
+            b'v',
+            b'e',
         ];
 
-        Self {
+        Self { packet }
+    }
+
+    //fn step_packet_sequence(&mut self) {
+    //    let mut seq = u16::from_be_bytes([self.packet[6], self.packet[7]]);
+    //    seq += 1; // overflow
+    //    self.packet[6] = (seq >> 8) as u8;
+    //    self.packet[7] = (seq & 0xff) as u8;
+    //}
+}
+
+// state
+struct Watcher<'a> {
+    socket: &'a UdpSocket,
+    sequence: u16,
+}
+
+impl<'a> Watcher<'a> {
+    fn new(socket: &'a UdpSocket) -> Self {
+        Watcher {
             socket,
-            packet,
-            buf: vec![0u8; 64],
+            // at start each host replies with 0
+            sequence: 0,
         }
     }
 
-    fn ping(&mut self, target: &str) -> Result<(), PingError> {
+    fn sleep(&self) {
+        std::thread::sleep(Duration::from_secs(INTERVAL_SECS));
+    }
+
+    fn ping(&mut self, msg: IcmpMessage, target: &str) -> Result<(), PingError> {
         let start = std::time::Instant::now();
+
         self.socket
-            .send_to(&self.packet, (target, 0))
+            .send_to(&msg.packet, (target, 0))
             .expect("unable to send packet");
 
-        let watcher_seq = u16::from_be_bytes([self.packet[6], self.packet[7]]);
+        // member function
         println!(
             "> ping {} {} bytes watcher_seq: {}",
             target,
-            self.packet.len(),
-            watcher_seq
+            &msg.packet.len(),
+            &self.sequence
         );
 
-        let (size, destination_addr) = match self.socket.recv_from(&mut self.buf) {
+        let mut buf = [0u8; 64];
+        let (size, destination_addr) = match self.socket.recv_from(&mut buf) {
             Ok((sz, dest)) => (sz, dest),
             Err(..) => {
                 eprintln!("Unable to receive response. Host must be down.");
                 return Err(PingError::Alarm);
             }
         };
+
         let duration = start.elapsed();
 
-        // basic validation check
-        if size < 8 {
-            return Err(PingError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("received only {} bytes", size),
-            )));
-        }
-
-        // 0 Echo Reply
-        // 3 Destination Unreachable
-        let type_byte = self.buf[0];
-
-        if type_byte == 0 {
-            // check messages sequence
-            let sequence_received = u16::from_be_bytes([self.buf[6], self.buf[7]]);
-            // let reply_seq = ((data[6] as u16) << 8) | (data[7] as u16);
-            if sequence_received != watcher_seq {
-                return Err(PingError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} responded with sequence {} but watcher send seq {}",
-                        target, watcher_seq, sequence_received
-                    ),
-                )));
-            }
+        let check = self.validate_response(&buf, target);
+        if check.is_ok() {
             // successfull print
+            let sequence_received = u16::from_be_bytes([buf[6], buf[7]]);
             println!(
                 "{} bytes from {} time={} ms, icmp_seq={}",
                 size,
@@ -134,34 +137,46 @@ impl Watcher {
                 duration.as_millis(),
                 sequence_received
             );
+        };
+        buf.fill(0);
+        check
+    }
+
+    fn validate_response(&self, buf: &[u8], target: &str) -> Result<(), PingError> {
+        let type_byte = buf[0];
+        // 0 Echo Reply
+        if type_byte == 0 {
+            let sequence_received = u16::from_be_bytes([buf[6], buf[7]]);
+            // let sequence_received = ((buf[6] as u16) << 8) | (buf[7] as u16);
+            if sequence_received != self.sequence {
+                return Err(PingError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} responded with sequence {} but watcher sent {}",
+                        target, sequence_received, self.sequence
+                    ),
+                )));
+            }
             return Ok(());
+        // 3 Destination Unreachable
         } else if type_byte == 3 {
-            println!(
-                "watcher_seq= {} Destination Host Unreachable. Destination: {}",
-                watcher_seq, destination_addr
-            );
+            eprintln!("Destination Host Unreachable: {}", target);
         } else {
-            println!("received message with type: {}", type_byte);
+            eprintln!("received message with type: {}", type_byte);
         }
         // raise the alarm on any not sucessfull reply.
-        // TODO: raise differect alarm severities per case
+        // TODO: raise different alarm severities per case
         Err(PingError::Alarm)
-    }
-
-    fn step_packet_sequence(&mut self) {
-        let mut seq = u16::from_be_bytes([self.packet[6], self.packet[7]]);
-        seq += 1; // overflow
-        self.packet[6] = (seq >> 8) as u8;
-        self.packet[7] = (seq & 0xff) as u8;
-    }
-
-    fn reset_buf(&mut self) {
-        self.buf.fill(0);
     }
 }
 
-fn main() {
-    let mut watchdog = Watcher::new();
+fn main() -> std::io::Result<()> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
+        .expect("cannot initialize Socket");
+    let socket: UdpSocket = socket.into();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
 
     let f = File::open("target_hosts").expect("target_hosts file not found");
     let reader = BufReader::new(f);
@@ -170,54 +185,42 @@ fn main() {
         .map(|l| l.expect("cannot create new string out of each host in the target_hosts file"))
         .collect();
 
-    //#[derive(PartialEq)]
-    //enum Status {
-    //    Alive,
-    //    Down,
-    //}
-
-    //let mut status_map: HashMap<String, Status> = HashMap::with_capacity(targets.len());
+    let mut watcher = Watcher::new(&socket);
 
     loop {
-        for host in &targets {
-            // TODO: make them async, but without futures
-            // keeping the state of each target host
-            match watchdog.ping(host) {
-                Ok(()) => {
-                    // update status
-                    //if let Some(status) = status_map.get_mut(host) {
-                    //    *status = Status::Alive;
-                    //}
+        for target in &targets {
+            let msg = IcmpMessage::new(watcher.sequence);
+            match watcher.ping(msg, target) {
+                Ok(..) => {
+                    // TODO: implement tolerance per target
                 }
-                Err(e) => match e {
-                    PingError::Alarm => {
-                        println!("Alarm! sending notification for host: {}", host);
-                        //status_map.insert(host.to_string(), Status::Down);
-                        if send_alarm_notification(Message::MakeNoise).is_err() {
-                            eprintln!("sending alarm notification returned error!");
+                Err(e) => {
+                    match e {
+                        PingError::Io(error) => {
+                            eprintln!("{error}");
+                            // do nothing for now
+                        }
+                        PingError::Alarm => {
+                            println!("alarm! {target} is down. Sending alarm notification");
+                            send_alarm_notification(IpcMessage::MakeNoise)?
                         }
                     }
-                    PingError::Io(ioerr) => {
-                        eprintln!("io error: {}", ioerr);
-                    }
-                },
-            };
-            watchdog.reset_buf();
+                }
+            }
         }
-
-        watchdog.step_packet_sequence();
-        std::thread::sleep(Duration::from_secs(INTERVAL_SECS));
+        watcher.sequence += 1;
+        watcher.sleep();
     }
 }
 
 // printf "\x01\x00\x00\x05" | nc 127.0.0.1 8080
-fn send_alarm_notification(message: Message) -> std::io::Result<()> {
+fn send_alarm_notification(message: IpcMessage) -> std::io::Result<()> {
     let mut addrs_iter = "olympus:8080".to_socket_addrs().unwrap();
     let addr = addrs_iter
         .next()
         .expect("addr must be created out of the domain");
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    println!("done connecting");
+    println!("connected to olympus");
 
     stream.write_all(&message.bytes())?;
     let mut buf = [0u8; 2];
