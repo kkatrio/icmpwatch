@@ -1,5 +1,6 @@
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::collections::HashMap;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
@@ -7,7 +8,8 @@ use std::{
     time::Duration,
 };
 
-const INTERVAL_SECS: u64 = 2;
+const INTERVAL_SECS: u64 = 5;
+const TOLERANCE: u8 = 2;
 
 #[derive(Debug)]
 enum PingError {
@@ -27,6 +29,7 @@ enum PingError {
  */
 enum IpcMessage {
     MakeNoise,
+    // Not sure this should ever be needed
     StopNoise,
 }
 
@@ -115,18 +118,27 @@ impl<'a> Watcher<'a> {
             &self.sequence
         );
 
+        // let recv read the expected reply before we send to the next target.
+        // Ideally, we could have recv_from in a separate thread and match each reply to its
+        // request.
+        // Without this delay, recv_from receives whichever reply happens to be first, and not
+        // necessarily the one corresponding to the last request.
+        // recv_from blocks for 2 seconds max, but it happens that a delayed reply from the
+        // previous request comes first.
+        std::thread::sleep(Duration::from_millis(10));
+
         let mut buf = [0u8; 64];
         let (size, destination_addr) = match self.socket.recv_from(&mut buf) {
             Ok((sz, dest)) => (sz, dest),
             Err(..) => {
-                eprintln!("Unable to receive response. Host must be down.");
+                eprintln!("Unable to receive response within read timeout. Host must be down.");
                 return Err(PingError::Alarm);
             }
         };
 
         let duration = start.elapsed();
 
-        let check = self.validate_response(&buf, target);
+        let check = self.validate_response(&buf, &destination_addr);
         if check.is_ok() {
             // successfull print
             let sequence_received = u16::from_be_bytes([buf[6], buf[7]]);
@@ -138,11 +150,11 @@ impl<'a> Watcher<'a> {
                 sequence_received
             );
         };
-        buf.fill(0);
+        //buf.fill(0);
         check
     }
 
-    fn validate_response(&self, buf: &[u8], target: &str) -> Result<(), PingError> {
+    fn validate_response(&self, buf: &[u8], addr: &SocketAddr) -> Result<(), PingError> {
         let type_byte = buf[0];
         // 0 Echo Reply
         if type_byte == 0 {
@@ -152,15 +164,15 @@ impl<'a> Watcher<'a> {
                 return Err(PingError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "{} responded with sequence {} but watcher sent {}",
-                        target, sequence_received, self.sequence
+                        "{} responded with sequence {sequence_received} but watcher sent {}",
+                        addr, self.sequence,
                     ),
                 )));
             }
             return Ok(());
         // 3 Destination Unreachable
         } else if type_byte == 3 {
-            eprintln!("Destination Host Unreachable: {}", target);
+            eprintln!("Destination Host Unreachable: {}", addr);
         } else {
             eprintln!("received message with type: {}", type_byte);
         }
@@ -187,12 +199,17 @@ fn main() -> std::io::Result<()> {
 
     let mut watcher = Watcher::new(&socket);
 
+    let mut tolerance: HashMap<String, u8> = HashMap::with_capacity(targets.len());
     loop {
+        println!("--- sequence: {} ---", watcher.sequence);
         for target in &targets {
             let msg = IcmpMessage::new(watcher.sequence);
             match watcher.ping(msg, target) {
                 Ok(..) => {
-                    // TODO: implement tolerance per target
+                    if tolerance.contains_key(target) {
+                        println!("removing from tolerance map");
+                        tolerance.remove(target);
+                    }
                 }
                 Err(e) => {
                     match e {
@@ -201,13 +218,27 @@ fn main() -> std::io::Result<()> {
                             // do nothing for now
                         }
                         PingError::Alarm => {
-                            println!("alarm! {target} is down. Sending alarm notification");
-                            send_alarm_notification(IpcMessage::MakeNoise)?
+                            println!("{target} seems down!");
+
+                            tolerance
+                                .entry(target.to_string())
+                                .and_modify(|t| {
+                                    *t += 1;
+                                })
+                                .or_default();
                         }
                     }
                 }
             }
         }
+
+        for (t, tol) in &tolerance {
+            if *tol == TOLERANCE {
+                println!("sending alarm notification for {t}");
+                send_alarm_notification(IpcMessage::MakeNoise)?
+            }
+        }
+
         watcher.sequence += 1;
         watcher.sleep();
     }
