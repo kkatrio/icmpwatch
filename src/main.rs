@@ -8,8 +8,8 @@ use std::{
     time::Duration,
 };
 
-const INTERVAL_SECS: u64 = 5;
-const TOLERANCE: u8 = 2;
+const INTERVAL_SECS: u64 = 3;
+const TOLERANCE: u8 = 3;
 
 #[derive(Debug)]
 enum PingError {
@@ -26,6 +26,7 @@ enum PingError {
  * stop noise # 1005
  * start loud alarm # 1006
  * stop loud alarm # 1007
+ * new event # 1010
  */
 enum IpcMessage {
     MakeNoise,
@@ -150,7 +151,6 @@ impl<'a> Watcher<'a> {
                 sequence_received
             );
         };
-        //buf.fill(0);
         check
     }
 
@@ -235,7 +235,9 @@ fn main() -> std::io::Result<()> {
         for (t, tol) in &tolerance {
             if *tol == TOLERANCE {
                 println!("sending alarm notification for {t}");
-                send_alarm_notification(IpcMessage::MakeNoise)?
+                if let Err(e) = send_alarm_notification(IpcMessage::MakeNoise) {
+                    eprintln!("failed to send message notification to olympus, error: {e}");
+                }
             }
         }
 
