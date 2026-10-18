@@ -17,6 +17,12 @@ enum PingError {
     Alarm,
 }
 
+impl From<io::Error> for PingError {
+    fn from(error: io::Error) -> Self {
+        PingError::Io(error)
+    }
+}
+
 /*
  * type # bytes
  * health check # 1001
@@ -31,14 +37,14 @@ enum PingError {
 enum IpcMessage {
     MakeNoise,
     // Not sure this should ever be needed
-    StopNoise,
+    //StopNoise,
 }
 
 impl IpcMessage {
     fn bytes(self) -> [u8; 4] {
         match self {
             Self::MakeNoise => [1, 0, 0, 4],
-            Self::StopNoise => [1, 0, 0, 5],
+            //Self::StopNoise => [1, 0, 0, 5],
         }
     }
 }
@@ -107,11 +113,8 @@ impl<'a> Watcher<'a> {
     fn ping(&mut self, msg: IcmpMessage, target: &str) -> Result<(), PingError> {
         let start = std::time::Instant::now();
 
-        self.socket
-            .send_to(&msg.packet, (target, 0))
-            .expect("unable to send packet");
+        self.socket.send_to(&msg.packet, (target, 0))?;
 
-        // member function
         println!(
             "> ping {} {} bytes watcher_seq: {}",
             target,
@@ -141,7 +144,6 @@ impl<'a> Watcher<'a> {
 
         let check = self.validate_response(&buf, &destination_addr);
         if check.is_ok() {
-            // successfull print
             let sequence_received = u16::from_be_bytes([buf[6], buf[7]]);
             println!(
                 "{} bytes from {} time={} ms, icmp_seq={}",
@@ -176,7 +178,7 @@ impl<'a> Watcher<'a> {
         } else {
             eprintln!("received message with type: {}", type_byte);
         }
-        // raise the alarm on any not sucessfull reply.
+        // raise the alarm on any not successful reply.
         // TODO: raise different alarm severities per case
         Err(PingError::Alarm)
     }
@@ -184,17 +186,15 @@ impl<'a> Watcher<'a> {
 
 fn main() -> std::io::Result<()> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
-        .expect("cannot initialize Socket");
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e))?;
     let socket: UdpSocket = socket.into();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
 
     let f = File::open("target_hosts").expect("target_hosts file not found");
     let reader = BufReader::new(f);
     let targets: Vec<String> = reader
         .lines()
-        .map(|l| l.expect("cannot create new string out of each host in the target_hosts file"))
+        .map(|l| l.expect("not valid string format in target_hosts file"))
         .collect();
 
     let mut watcher = Watcher::new(&socket);
@@ -248,10 +248,11 @@ fn main() -> std::io::Result<()> {
 
 // printf "\x01\x00\x00\x05" | nc 127.0.0.1 8080
 fn send_alarm_notification(message: IpcMessage) -> std::io::Result<()> {
-    let mut addrs_iter = "olympus:8080".to_socket_addrs().unwrap();
+    let mut addrs_iter = "olympus:8080".to_socket_addrs()?;
     let addr = addrs_iter
         .next()
-        .expect("addr must be created out of the domain");
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "address not found"))?;
+
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     println!("connected to olympus");
 
